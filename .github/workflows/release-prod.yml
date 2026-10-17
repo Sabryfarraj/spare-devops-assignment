@@ -1,0 +1,216 @@
+name: Release (prod)
+
+run-name: "prod release: ${{ github.ref_name }} by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    # Fail loudly, before any prod secret is touched, if started from the wrong branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Only run from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Production releases must be run from main (selected: $GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+  verify:
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: stg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (with layer cache)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ghcr.io/sabryfarraj/spare-devops-assignment-stg:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write .env from environment secrets
+        env:
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          umask 077
+          {
+            echo "DB_NAME=$DB_NAME"
+            echo "DB_USER=$DB_USER"
+            echo "DB_PASSWORD=$DB_PASSWORD"
+          } > .env
+
+      - name: Pull database image
+        run: docker compose version && docker compose -f docker-compose-stg.yml pull db
+
+      - name: Start stack and wait until healthy
+        # Use the image built above, never pull the API
+        run: API_TAG=ci docker compose -f docker-compose-stg.yml up -d --pull never --wait --wait-timeout 90
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          BASE=http://localhost:8080
+
+          curl -fsS "$BASE/health" | jq -e '.status == "ok"'
+
+          USER_ID=$(curl -fsS -X POST "$BASE/users" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"ci-smoke"}' | jq -er '.id')
+
+          curl -fsS -X POST "$BASE/notifications" \
+            -H 'Content-Type: application/json' \
+            -d "{\"user_id\":${USER_ID},\"title\":\"smoke\",\"body\":\"ok\"}" | jq -e '.id'
+
+          COUNT=$(curl -fsS "$BASE/notifications?user_id=${USER_ID}" | jq 'length')
+          test "$COUNT" -eq 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose-stg.yml ps -a && docker compose -f docker-compose-stg.yml logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose-stg.yml down -v
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: prod
+    timeout-minutes: 15
+    permissions:
+      contents: write   # push the version git tag
+      packages: write   # push the image to GHCR
+    outputs:
+      package: ${{ steps.img.outputs.package }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Compute image name
+        id: img
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY,,}"
+          NAME="${REPO#*/}"
+          echo "IMAGE=ghcr.io/${REPO%%/*}/${NAME}" >> "$GITHUB_ENV"
+          echo "package=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          PREFIX="v"
+          LAST=$(git ls-remote --tags --refs origin \
+            | sed 's#.*refs/tags/##' \
+            | grep -E "^${PREFIX}[0-9]+$" \
+            | sed "s/^${PREFIX}//" \
+            | sort -n | tail -1 || true)
+          NEXT=$(( ${LAST:-0} + 1 ))
+          echo "image_tag=v${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "git_tag=${PREFIX}${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Reserve version (git tag, fails if it already exists)
+        env:
+          GIT_TAG: ${{ steps.ver.outputs.git_tag }}
+        run: |
+          git tag "$GIT_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$GIT_TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.image_tag }}
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build summary
+        env:
+          VERSION: ${{ steps.ver.outputs.image_tag }}
+          GIT_TAG: ${{ steps.ver.outputs.git_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "## Released \`${VERSION}\` of the image (prod)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Branch | \`${GITHUB_REF_NAME}\` |"
+            echo "| Triggered by | @${GITHUB_ACTOR} |"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+            echo "| Git tag | \`${GIT_TAG}\` |"
+            echo "| Time (Riyadh, GMT+3) | $(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S') |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo
+            echo "Tags pushed:"
+            echo
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+            echo
+            echo "Pull: \`docker pull ${IMAGE}:${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    # Keep only the newest 10 versions of the prod package
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Prune old image versions
+        uses: snok/container-retention-policy@v3.1.0
+        with:
+          account: user
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: ${{ needs.publish.outputs.package }}
+          cut-off: 1d
+          keep-n-most-recent: 10
+          timestamp-to-use: created_at
+          dry-run: true
