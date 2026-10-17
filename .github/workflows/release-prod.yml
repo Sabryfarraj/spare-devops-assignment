@@ -213,4 +213,4 @@ jobs:
           cut-off: 1d
           keep-n-most-recent: 10
           timestamp-to-use: created_at
-          dry-run: true
+          dry-run: false
